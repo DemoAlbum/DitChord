@@ -1,0 +1,173 @@
+name: DitChord Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游分支/tag/commit（留空 = 上游默认分支）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# 防止两次构建同时跑，互相抢同一个 tag / release
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: kushagrasinghx/BitChord
+  FORK_APP_ID: com.ditchord
+  FORK_APP_NAME: DitChord
+  FORK_APK_PREFIX: DitChord
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # 检出上游源码（不是 Ditchord 自己）。公开仓库，不需要 token。
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ inputs.upstream_ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # 只在 CI 工作区里改，不提交。上游改动导致锚点失效时，这一步会直接报错，
+      # 而不是悄悄构建出一个没打上补丁的包。
+      - name: Apply fork patches
+        run: |
+          set -euo pipefail
+
+          # 1. 中文区域的 gl：SG -> US（已经是 US 则无操作）
+          F=shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/LocaleTags.kt
+          sed -i 's/ZH_HANS -> "SG"/ZH_HANS -> "US"/' "$F"
+          grep -q 'ZH_HANS -> "US"' "$F" || { echo "::error::LocaleTags patch failed"; exit 1; }
+
+          # 2. 包名（只改 applicationId，手机和手表一起改；namespace 不动）
+          for f in app/build.gradle.kts wearos/build.gradle.kts; do
+            sed -i "s/applicationId = \"com\.music\.bitchord\"/applicationId = \"${FORK_APP_ID}\"/" "$f"
+            grep -q "applicationId = \"${FORK_APP_ID}\"" "$f" || { echo "::error::applicationId patch failed in $f"; exit 1; }
+          done
+
+          # 3. 应用名：手机端所有语言 + 手表端
+          find app/src/main/res -path '*values*/strings.xml' -exec \
+            sed -i -E "s#(<string name=\"app_name\"[^>]*>)BitChord(</string>)#\1${FORK_APP_NAME}\2#" {} +
+          grep -q ">${FORK_APP_NAME}<" app/src/main/res/values/strings.xml \
+            || { echo "::error::app_name patch failed"; exit 1; }
+          sed -i "s/resValue(\"string\", \"app_name\", \"BitChord\")/resValue(\"string\", \"app_name\", \"${FORK_APP_NAME}\")/" wearos/build.gradle.kts
+          grep -q "\"${FORK_APP_NAME}\"" wearos/build.gradle.kts \
+            || { echo "::error::wear app_name patch failed"; exit 1; }
+
+          # 4. 应用内更新指向 Ditchord 仓库（GITHUB_REPOSITORY = 你的用户名/Ditchord）
+          U=app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+          sed -i "s#kushagrasinghx/BitChord/releases/latest#${GITHUB_REPOSITORY}/releases/latest#" "$U"
+          grep -q "${GITHUB_REPOSITORY}/releases/latest" "$U" \
+            || { echo "::error::update URL patch failed"; exit 1; }
+
+          # 5. 应用内更新识别的 APK 文件名前缀（必须与下面的改名步骤一致）
+          sed -i "/UPDATE_APK_PREFIX/s/BitChord-/${FORK_APK_PREFIX}-/" app/build.gradle.kts
+          grep -q "UPDATE_APK_PREFIX.*${FORK_APK_PREFIX}-" app/build.gradle.kts \
+            || { echo "::error::update prefix patch failed"; exit 1; }
+
+          git diff --stat
+
+      # 版本号直接读上游的，tag 与 versionName 一致，应用内更新才能正确比较
+      - name: Compute tag
+        run: |
+          set -euo pipefail
+          VER=$(sed -nE 's/.*extra\["bitchordVersionName"\] *= *"([^"]*)".*/\1/p' build.gradle.kts)
+          SUF=$(sed -nE 's/.*extra\["bitchordBetaSuffix"\] *= *"([^"]*)".*/\1/p' build.gradle.kts)
+          [ -n "$VER" ] || { echo "::error::could not read bitchordVersionName"; exit 1; }
+          TAG="v${VER}"; PRE=false
+          if [ -n "$SUF" ]; then TAG="${TAG}-${SUF}"; PRE=true; fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "PRE=$PRE" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Building $TAG from upstream $(git rev-parse --short HEAD)"
+
+      # 可选的 secret 为空时不写入，这样 LISTEN_TOGETHER_SERVER 会回退到代码里的默认服务器
+      - name: Setup secrets
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          LISTEN_TOGETHER_SERVER: ${{ secrets.LISTEN_TOGETHER_SERVER }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEYSTORE_BASE64" ] || { echo "::error::KEYSTORE_BASE64 secret is empty (add it to the Ditchord repo secrets)"; exit 1; }
+
+          : > local.properties
+          [ -z "$LASTFM_API_KEY" ]         || echo "LASTFM_API_KEY=$LASTFM_API_KEY" >> local.properties
+          [ -z "$LASTFM_SECRET" ]          || echo "LASTFM_SECRET=$LASTFM_SECRET" >> local.properties
+          [ -z "$LISTEN_TOGETHER_SERVER" ] || echo "LISTEN_TOGETHER_SERVER=$LISTEN_TOGETHER_SERVER" >> local.properties
+
+          echo "$KEYSTORE_BASE64" | base64 -d > bitchord-release.jks
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - run: chmod +x gradlew
+
+      # 只构建手机端；手表端是它的依赖，会自动一起构建。
+      # 如果这一步报错，改回 ./gradlew assembleProdRelease
+      - run: ./gradlew :app:assembleProdRelease
+
+      # 文件名前缀必须与上面补丁里的 UPDATE_APK_PREFIX 一致，应用内更新才找得到 APK
+      - name: Rename APKs for the in-app updater
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p dist
+          for f in app/build/outputs/apk/prod/release/*.apk; do
+            case "$(basename "$f")" in
+              *arm64-v8a*)   s="_arm64-v8a" ;;
+              *armeabi-v7a*) s="_armeabi-v7a" ;;
+              *x86_64*)      s="_x86_64" ;;
+              *universal*)   s="" ;;
+              *) continue ;;
+            esac
+            cp "$f" "dist/${FORK_APK_PREFIX}-${TAG}${s}.apk"
+          done
+          [ -n "$(ls dist/*.apk 2>/dev/null)" ] || { echo "::error::no phone APK found"; exit 1; }
+
+          wear=(wearos/build/outputs/apk/prod/release/*.apk)
+          if [ ${#wear[@]} -eq 0 ]; then
+            echo "::warning::no Wear APK found, skipping"
+          else
+            for f in "${wear[@]}"; do
+              cp "$f" "dist/${FORK_APK_PREFIX}Wear-${TAG}.apk"
+            done
+          fi
+          ls -l dist
+
+      # 构建成功后才删旧 release，构建失败不会误删现有版本。
+      # 同版本重跑时会用新 APK 覆盖。
+      - name: Delete old release if exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y || true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.FORK_APP_NAME }} ${{ env.TAG }}
+          prerelease: ${{ env.PRE == 'true' }}
+          body: Built from upstream ${{ env.UPSTREAM_REPO }} commit ${{ env.UPSTREAM_SHA }}
+          files: dist/*.apk
+          fail_on_unmatched_files: true
